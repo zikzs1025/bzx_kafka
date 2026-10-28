@@ -1,0 +1,296 @@
+# =====================================================================================
+# kafka-file-loader 主配置
+#
+# 本服务职责：从 Kafka 批量消费 -> 按《数据表字段清单》31 个字段顺序生成 CSV（\t 分隔）
+#              -> 每 5 万条滚动成新文件 -> 本地备份 -> 上传 FTP。不连任何数据库。
+#
+# 全部配置集中在本文件，不再读取任何外部节点清单文件。
+# 敏感项（FTP 密码）支持环境变量覆盖，写法 ${变量名:默认值}。
+# =====================================================================================
+
+# -------------------------------------------------------------------------------------
+# HTTP 服务：仅用于运维接口与 Swagger，不承载业务流量
+# -------------------------------------------------------------------------------------
+server:
+  # 运维接口/健康检查端口。若被环境变量 SERVER_PORT 覆盖，以环境变量为准
+  port: 8080
+  # 优雅停机：收到停止信号后先停止拉取新消息，把正在处理的批次封盘并上传，再退出。
+  # 未完成的 offset 不提交，重启后由 Kafka 重投，保证不丢数据
+  shutdown: graceful
+  tomcat:
+    # 运维接口连接超时，避免慢连接长期占用线程
+    connection-timeout: 30s
+
+spring:
+  application:
+    # 应用名，同时用于日志文件名、Micrometer 指标标签
+    name: kafka-file-loader
+  main:
+    # 关闭启动 Banner，让启动日志更清爽（便于 grep 关键行）
+    banner-mode: "off"
+  lifecycle:
+    # 优雅停机最长等待时间，需大于一批 5 万条的落盘 + 上传耗时；
+    # 超时仍未结束则强制退出，未提交的 offset 由 Kafka 重投
+    timeout-per-shutdown-phase: 60s
+  jackson:
+    # 接口返回 JSON 时不输出 null 字段，Swagger 调试返回更简洁
+    default-property-inclusion: non_null
+
+# -------------------------------------------------------------------------------------
+# Kafka 集群与消费者
+# -------------------------------------------------------------------------------------
+kafka:
+  cluster:
+    # 集群标识，仅用于日志与运维展示，不参与连接
+    name: DISTRIBUTE
+    # 消费主题。启动时校验：只能由字母、数字、点、下划线、连字符组成，长度 1~249
+    topic: DISTRIBUTE_SQAJXYRXX_TO3301
+    # 节点未写端口时使用的兜底端口
+    default-port: 9092
+
+    # -----------------------------------------------------------------------------------
+    # 连接安全：Kerberos 认证（GSSAPI），材料来自现场发放的 330100.tar（REALM=SYNWAY.COM，
+    # principal=330100@SYNWAY.COM，KDC=cmkafka）。默认已启用 SASL_PLAINTEXT。
+    # 注意：broker 的 9092 即 SASL_PLAINTEXT 监听（明文客户端会被踢，旧版无限 disconnected 的根因）。
+    # 部署机需能解析主机名 cmkafka（/etc/hosts 加一行：12.100.1.180 cmkafka），否则 KDC 找不到。
+    # -----------------------------------------------------------------------------------
+    security:
+      # SASL_PLAINTEXT=Kerberos 认证不加密传输；若 broker 另开了 TLS 监听则改 SASL_SSL，
+      # 并增加 ssl 段（truststore-location / truststore-password / truststore-type）
+      protocol: SASL_PLAINTEXT
+      sasl:
+        # GSSAPI = Kerberos
+        mechanism: GSSAPI
+        # principal，来自 ktab -l -k user.keytab
+        username: 330100@SYNWAY.COM
+        # keytab 与 krb5.conf 相对进程工作目录（分发包根），随包在 config/kerberos/ 下
+        keytab-location: ./config/kerberos/user.keytab
+        krb5-conf: ./config/kerberos/krb5.conf
+        # broker 端 server.properties 的 sasl.kerberos.service.name，不确定时保持 kafka
+        kerberos-service-name: kafka
+
+    # Kerberos 启用模板（把上面的 protocol 改成 SASL_PLAINTEXT 或 SASL_SSL，并放开 sasl 段）：
+    # security:
+    #   protocol: SASL_PLAINTEXT
+    #   sasl:
+    #     mechanism: GSSAPI
+    #     username: <principal>
+    #     keytab-location: ./config/kerberos/user.keytab
+    #     krb5-conf: ./config/kerberos/krb5.conf
+
+    # broker 节点清单，这是唯一的节点来源（不再读取外部文件）。
+    # ★ Kerberos 场景必须用「主机名」而不是 IP：
+    #   客户端向 KDC 申领的票据是 kafka/<连接用的名字>@SYNWAY.COM，用 IP 连会去要
+    #   kafka/12.100.1.180@SYNWAY.COM（KDC 里不存在），报 Server not found in Kerberos database (7)。
+    #   主机名需在部署机 /etc/hosts 有映射（执行 ./bin/setup-hosts.sh 一键写入）。
+    # 规则：端口可省略（用 default-port）；重复的 host:port 自动去重；
+    #       单条格式非法只告警跳过，不影响其他节点；全部非法则启动失败。
+    # 改完需重启进程生效（本版本不再支持热重载）。
+    bootstrap-servers:
+      # 集群入口/管理节点，同时是 KDC（krb5.conf 中 kdc = cmkafka:88）
+      - cmkafka:9092        # 12.100.1.180
+      - kafka01:9092        # 12.100.1.181
+      - kafka02:9092        # 12.100.1.182
+      - kafka03:9092        # 12.100.1.183
+      - kafka04:9092        # 12.100.1.184
+      - kafka05:9092        # 12.100.1.185
+      - kafka06:9092        # 12.100.1.186
+      - kafka07:9092        # 12.100.1.187
+      - kafka09:9092        # 12.100.1.189（现场无 .188 节点）
+      - kafka08:9092        # 12.100.1.190（现场编号与 IP 顺序相反）
+      - kafka10:9092        # 12.100.1.203
+      - kafka11:9092        # 12.100.1.228
+      - kafka12:9092        # 12.100.1.229
+      - kafka13:9092        # 12.100.1.230
+      - kafka14:9092        # 12.100.1.231
+      - kafka15:9092        # 12.100.1.232
+
+  consumer:
+    # 消费组名。现场 ACL 是按「账号 330100 + 消费组 330100」授权的，
+    # 组名与 ACL 登记不一致会直接报 GroupAuthorizationException，故必须用 330100。
+    # 注意：换组名等于换一个消费者，若该组在目标主题上已有提交的 offset 则从断点续消费，
+    # 没有 offset 时按 auto-offset-reset=earliest 从头消费（可用 kafka-consumer-groups.sh --describe 确认）。
+    group-id: 330100
+    # 并发消费者线程数，不大于该主题的分区数才有意义（多出的线程会空转）
+    concurrency: 3
+    # 单次 poll 最多拉取的消息条数。调大提升吞吐但单批内存占用与故障重投范围也变大
+    max-poll-records: 500
+    # 无已提交 offset 时的起始位置：earliest=从最早开始（数据安全优先，宁可重复不丢）
+    auto-offset-reset: earliest
+    # 处理失败（磁盘满、FTP 不可用等）后容器重试间隔
+    retry-interval-ms: 2000
+    # 最大重试次数，-1 表示无限重试：宁可卡住等人处理，也不跳过数据
+    max-retries: -1
+    # 单次 poll 等待数据的毫秒数，越小越灵敏、越大越省 CPU
+    poll-timeout-ms: 3000
+    # 两次 poll 之间允许的最大间隔，超过则被踢出消费组（需大于一批数据的落盘耗时）
+    max-poll-interval-ms: 300000
+    # 单次 fetch 请求返回的最大字节数，控制单批内存峰值
+    fetch-max-bytes: 52428800
+
+# -------------------------------------------------------------------------------------
+# 文件管道：落盘 -> 备份 -> 上传 FTP
+# 目录全部为相对路径，相对进程工作目录（start.sh/start.bat 会先切换到项目根）
+# -------------------------------------------------------------------------------------
+file:
+  # 正在写入的暂存目录（*.writing 文件，未封盘前不可被上传任务看到）
+  stage-dir: ./data/file-stage
+  # 已封盘等待上传的目录，上传成功后才删除
+  pending-dir: ./data/file-pending
+  # 本地备份目录，按 dt=YYYY-MM-DD 分子目录，上传成功后仍保留，用于事后追溯
+  backup-dir: ./data/file-backup
+  # 上传重试用尽的文件移到这里人工处理，不删除
+  failed-dir: ./data/file-failed
+  # 脏数据隔离目录：消息体不是 JSON 对象或为空时按天写入
+  # <系统名称>_reject_yyyyMMdd.csv，保留 topic/partition/offset 便于回查，绝不丢弃
+  reject-dir: ./data/file-reject
+
+  # 系统配置名称，用于拼装文件名：系统配置名称_yyyyMMddHHmmssSSS<扩展名>
+  # 留空则回退 kafka.cluster.name，保证文件名永远能反查来源系统
+  system-name: DISTRIBUTE
+
+  # 输出文件扩展名，默认 .txt（字段以 \t 分隔）。主数据文件与隔离文件统一使用该扩展名
+  # 可写 txt / .txt / .csv，程序自动补前导点
+  file-extension: .txt
+
+  # 单个文件最大数据行数，达到即封盘并生成新文件
+  # 同一毫秒内多次滚动时文件名追加 -1/-2 后缀，绝不覆盖已有文件
+  records-per-file: 50000
+
+  # 稳定性开关：每批数据写完后对文件执行 flush + fsync 强制落盘，
+  # 防止操作系统崩溃/断电导致已提交 offset 的数据实际还在页缓存里而丢失。
+  # 关闭可提升吞吐，但违背「稳定性大于一切」，生产环境请保持 true
+  fsync-per-batch: true
+
+  # 空闲判定：暂存文件超过该时长没有新数据写入就封盘，避免低峰期数据长期滞留本地
+  idle-flush-ms: 60000
+  # 空闲检查周期（检测哪些暂存文件可以封盘）
+  flush-check-interval-ms: 30000
+  # 扫描待上传目录并执行上传的周期
+  upload-interval-ms: 60000
+
+  # 背压护栏一：待上传文件数超过该值说明 FTP 消费不过来，
+  # 暂停消费（不提交 offset），防止把本地磁盘写满
+  max-pending-files: 2000
+  # 背压护栏二：磁盘剩余空间低于该值（MB）时同样暂停消费
+  min-free-disk-mb: 2048
+
+  # 本地备份保留天数，超过由清理任务删除（只删备份，不影响 FTP）
+  backup-retention-days: 7
+  # 单个文件上传最大尝试次数，用尽后移入 failed-dir 并告警
+  upload-max-attempts: 10
+  # 备份清理任务执行时间（Quartz cron：秒 分 时 日 月 周），默认每天凌晨 3:30
+  backup-cleanup-cron: "0 30 3 * * ?"
+
+  # 启动时是否执行崩溃恢复：扫描上次异常退出遗留的 .writing 文件，
+  # 有内容的封盘转为待上传，无内容的清理掉
+  recover-on-start: true
+
+  # -----------------------------------------------------------------------------------
+  # 报文解析：决定 Kafka 消息体如何映射成 31 列
+  # 现场报文是「空格分隔的平铺文本」，按位置装载；若上游改为 JSON 对象也能自动识别
+  # -----------------------------------------------------------------------------------
+  # AUTO（默认）：以 { 开头按 JSON 对象解析，否则按 delimiter-regex 切分
+  # JSON：只接受 JSON 对象；DELIMITER：只按分隔符切分
+  # RAW：原样透传——不解析、不校验列数、不补位，行内 TAB 与空字段原封不动（现场采用）
+  parse-mode: RAW
+  # 分隔符正则。现场报文是 TAB 分隔的 31 列（空字段靠连续 TAB 占位），
+  # 因此必须用精确分隔符 \t，不能用 \\s+（会把连续 TAB 合并，导致列整体左移）
+  delimiter-regex: "\t"
+  # 期望列数：
+  #   0         = 自适应（现场采用）：不限制列数，报文行内有多少列就输出多少列（空值仍写 \N）
+  #   31        = 按《字段清单》装载，配合下面的 strict-field-count 决定补位还是拒收
+  # 现场实测每行有效列数约 12，故不按 31 做校验/补位
+  expected-columns: 0
+
+  # 字段数策略（expected-columns > 0 时生效）：
+  #   true  = 严格（现场采用）：列数不等于期望值整行舍弃、原文留存隔离区
+  #   false = 宽容：不足补 \N、多于截断（仅临时排查时用，有错位风险）
+  strict-field-count: true
+
+  # 列映射（可选）：上游报文的列顺序与《字段清单》不一致时用它转换。
+  # 写法＝按报文顺序，逐个写出该源列要落到清单的第几列（1~31），逗号分隔。
+  # 未列出的清单列自动写 \N；留空表示「报文列序 == 清单列序」，按位置直接装载。
+  # 例：报文依次是 证件号(清单19) / 姓名(20) / 性别(21) / 出生日期(25)
+  # column-mapping: "19,20,21,25"
+  column-mapping: ""
+
+# -------------------------------------------------------------------------------------
+# FTP 上传目标（最终交付位置）
+# -------------------------------------------------------------------------------------
+ftp:
+  # 总开关。设为 false 时文件只落在 pending 目录不外发，便于本地调试
+  enabled: true
+  host: 127.0.0.1
+  port: 21
+  username: kafka
+  # 密码建议用环境变量注入：FTP_PASSWORD=xxx 启动，避免明文进代码库
+  password: ${FTP_PASSWORD:}
+  # 远端目录，不存在时自动逐级创建
+  remote-dir: /kafka/incoming
+  # 被动模式。跨防火墙/云环境一般必须为 true
+  passive-mode: true
+  # 控制连接编码，文件名含中文时必须与服务端一致，否则远端文件名乱码
+  encoding: UTF-8
+  # 建立控制连接超时
+  connect-timeout-ms: 10000
+  # 数据传输（STOR）超时，大文件需留足时间
+  data-timeout-ms: 120000
+  # 传输缓冲区大小，1MB 在多数网络下吞吐与内存占用较平衡
+  buffer-size: 1048576
+  # 上传完成后回读远端文件大小并与本地比对，一致才算成功
+  verify-size: true
+  # 上传成功且校验通过后删除本地 pending 文件（backup 目录仍保留副本）
+  delete-after-upload: true
+
+# -------------------------------------------------------------------------------------
+# Swagger / OpenAPI 文档
+# -------------------------------------------------------------------------------------
+springdoc:
+  swagger-ui:
+    # 文档页面地址：http://<host>:<port>/swagger-ui.html
+    path: /swagger-ui.html
+    tags-sorter: alpha
+    operations-sorter: alpha
+  api-docs:
+    # OpenAPI JSON 地址，可导入 Postman/Apifox
+    path: /v3/api-docs
+
+# -------------------------------------------------------------------------------------
+# Actuator 监控端点（/actuator/health 可用于进程存活探测）
+# -------------------------------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        # 仅暴露健康、信息、指标三类，其余端点不对外
+        include: health,info,metrics
+  metrics:
+    tags:
+      # 指标统一打上应用标签，便于多实例聚合
+      application: kafka-file-loader
+
+# -------------------------------------------------------------------------------------
+# 日志
+#
+# 实际生效的 appender / 滚动策略在 logback-spring.xml 中定义，本段只提供路径与级别：
+#   - 文件：${logging.file.path}/kafka-file-loader.log（当前写入文件）
+#   - 归档：kafka-file-loader.yyyy-MM-dd.N.log.gz（按天 + 单文件 200MB 切分，自动 gzip）
+#   - 保留：最多 15 天（maxHistory=15），总量上限 20GB，启动时清理过期归档
+#   - 异步：日志经 8192 容量队列异步落盘，避免磁盘抖动阻塞消费线程
+# -------------------------------------------------------------------------------------
+logging:
+  # 日志根目录，相对进程工作目录；不存在会自动创建
+  file:
+    path: ./logs
+  level:
+    # 第三方框架日志保持 INFO，避免刷屏
+    root: INFO
+    # 本工程包级别设为 DEBUG：记录批次明细、文件滚动、上传进度、背压触发等排障关键信息
+    com.example.kafkaloader: DEBUG
+    # Kafka 客户端内部日志极其啰嗦，只在出问题时临时调成 DEBUG
+    org.apache.kafka: WARN
+    # Spring Kafka 容器启停、分区分配等生命周期事件保留 INFO
+    org.springframework.kafka: INFO
+    # FTP 客户端（commons-net）连接与命令交互细节，排查上传失败时有用
+    org.apache.commons.net: INFO

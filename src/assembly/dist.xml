@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+================================================================================
+ 分发包描述：jar / lib / config 三者分离
+================================================================================
+ 产出结构（target/dist/ 与 target/服务名-版本号.tar.gz）：
+
+   dist/
+   ├── kafka-file-loader.jar     业务代码（不含任何第三方依赖、不含配置文件）
+   ├── lib/                      运行时依赖，约 63 个 jar
+   ├── config/
+   │   ├── application.yml        全部业务配置，部署后可直接改
+   │   └── logback-spring.xml     日志策略，部署后可直接改
+   ├── bin/
+   │   ├── start.sh
+   │   └── start.bat
+   ├── 更新说明.txt                按年月日累积的变更 / 打包记录
+   └── README.md
+
+ 打包格式（dir / tar.gz）在 pom.xml 的两处 execution 里分别声明，
+ 这样目录产物固定叫 target/dist（启动脚本按此路径探测），
+ 而 tar.gz 产物按「服务名-版本号-年月日」命名。
+
+ 启动方式（必须带 -Dloader.path，PropertiesLauncher 靠它加载 lib/）：
+   cd dist && java -Dloader.path=lib -Dlogging.config=config/logback-spring.xml -jar kafka-file-loader.jar
+================================================================================
+-->
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.1.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.1.0 http://maven.apache.org/xsd/assembly-2.1.0.xsd">
+
+    <id>dist</id>
+
+    <!-- 不指定 baseDirectory：解压即得到 jar/lib/config/bin 同级布局 -->
+    <includeBaseDirectory>false</includeBaseDirectory>
+
+    <files>
+        <!-- 瘦 jar 放根目录，与 lib/ config/ 平级 -->
+        <file>
+            <source>${project.build.directory}/${project.build.finalName}.jar</source>
+            <outputDirectory>/</outputDirectory>
+        </file>
+        <file>
+            <source>${project.basedir}/README.md</source>
+            <outputDirectory>/</outputDirectory>
+        </file>
+        <!-- 更新说明：按年月日累积，每次打包自动追加构建记录 -->
+        <file>
+            <source>${project.basedir}/CHANGELOG.txt</source>
+            <outputDirectory>/</outputDirectory>
+            <destName>更新说明.txt</destName>
+        </file>
+    </files>
+
+    <fileSets>
+        <!-- 第三方依赖 -->
+        <fileSet>
+            <directory>${project.build.directory}/dist-lib</directory>
+            <outputDirectory>lib</outputDirectory>
+            <fileMode>0644</fileMode>
+        </fileSet>
+
+        <!-- 外置配置：从源码资源目录直接取，绕开 jar 打包排除 -->
+        <fileSet>
+            <directory>${project.basedir}/src/main/resources</directory>
+            <outputDirectory>config</outputDirectory>
+            <includes>
+                <include>application.yml</include>
+                <include>logback-spring.xml</include>
+            </includes>
+            <fileMode>0644</fileMode>
+        </fileSet>
+
+        <!-- Kerberos 认证材料占位目录：krb5.conf / user.keytab 由运维部署时放入，
+             不随包分发（凭据不进版本库），路径在 application.yml 的 kafka.cluster.security.sasl 段引用 -->
+        <fileSet>
+            <directory>${project.basedir}/src/assembly/kerberos</directory>
+            <outputDirectory>config/kerberos</outputDirectory>
+            <fileMode>0600</fileMode>
+        </fileSet>
+
+        <!-- 可执行脚本 -->
+        <fileSet>
+            <directory>${project.basedir}/bin</directory>
+            <outputDirectory>bin</outputDirectory>
+            <fileMode>0755</fileMode>
+        </fileSet>
+    </fileSets>
+</assembly>

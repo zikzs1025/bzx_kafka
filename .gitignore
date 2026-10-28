@@ -1,0 +1,15 @@
+target/
+data/
+*.log
+.idea/
+*.iml
+.vscode/
+*.jks
+*.p12
+*.key
+*.keytab
+config/certs/
+config/kerberos/
+.workbuddy/
+src/assembly/kerberos/krb5.conf
+output/

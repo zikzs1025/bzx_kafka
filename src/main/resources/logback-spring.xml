@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+================================================================================
+ 日志配置（logback-spring.xml）
+================================================================================
+ 1. 输出位置
+      控制台        : 便于前台调试 / docker logs
+      logs/*.log    : 当前正在写的文件
+      logs/*.log.gz : 滚动后的历史文件，自动 gzip 压缩
+    目录由 application.yml 的 logging.file.path 决定（默认 ./logs）
+
+ 2. 滚动策略（每日压缩 + 单文件上限）
+    每天 0 点自动切分，切出来的文件压成 .gz；
+    同一天内单个文件超过 200MB 也会切分（序号 .0 .1 .2），防止一天写爆磁盘。
+    文件名示例：kafka-file-loader.2026-10-23.0.log.gz
+
+ 3. 保留策略
+    maxHistory=15          : 最多保留 15 天，第 16 天的文件在滚动时删除
+    totalSizeCap=20GB      : 总量封顶，超出先删最旧的
+    cleanHistoryOnStart    : 启动时先清一次超期文件，长期不重启也能按时清理
+
+ 4. 详细程度
+    业务包 com.example.kafkaloader 打 DEBUG：节点解析、每批写入、封盘、备份、
+    上传、脏数据隔离全部留痕；Kafka / Tomcat 等框架包压到 WARN，避免刷屏。
+    需要临时调整时改 application.yml 的 logging.level.*，其优先级高于本文件。
+
+ 5. 性能
+    文件写入走异步队列（queueSize=8192）：
+      discardingThreshold=0 表示队列满也不丢弃日志；
+      neverBlock=false 表示队列满时阻塞业务线程而不是丢日志，宁可慢也不丢；
+      includeCallerData=true 保证异步情况下 %line 仍能输出行号。
+
+ 6. 格式
+    时间精确到毫秒、带线程名、logger 与源码行号，排查问题时能直接定位到行。
+================================================================================
+-->
+<configuration scan="false">
+
+    <!-- 日志目录：来自 application.yml 的 logging.file.path，未配置时用 ./logs -->
+    <springProperty scope="context" name="LOG_DIR" source="logging.file.path" defaultValue="logs"/>
+
+    <!-- 文件名前缀，改这里即可换名（改后请同步 scripts/start.sh 的提示文案） -->
+    <property name="APP_NAME" value="kafka-file-loader"/>
+
+    <!-- 滚动参数：默认单文件 200MB、保留 15 天。
+         如需临时调整可用 JVM 参数覆盖，无需改本文件：
+             -DLOG_MAX_FILE_SIZE=100MB -DLOG_MAX_HISTORY=30 -->
+    <property name="MAX_FILE_SIZE" value="${LOG_MAX_FILE_SIZE:-200MB}"/>
+    <property name="MAX_HISTORY" value="${LOG_MAX_HISTORY:-15}"/>
+
+    <!-- 控制台格式：不带颜色，避免被重定向到文件时混入 ANSI 转义符 -->
+    <property name="CONSOLE_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{50}:%line - %msg%n"/>
+
+    <!-- 文件格式：与控制台一致，另加 pid，多实例写同一目录时可区分来源 -->
+    <property name="FILE_PATTERN"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] ${PID:-} %logger{60}:%line - %msg%n"/>
+
+    <!-- ====================== 控制台 ====================== -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${CONSOLE_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ====================== 滚动文件 ====================== -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <!-- 当前正在写的文件（文件名不带日期，方便 tail -f） -->
+        <file>${LOG_DIR}/${APP_NAME}.log</file>
+        <encoder>
+            <pattern>${FILE_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <!-- 按天切分并 gzip 压缩，%i 是当天的分片序号 -->
+            <fileNamePattern>${LOG_DIR}/${APP_NAME}.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <!-- 单文件上限，超过就切下一个序号（同一天可能有多份） -->
+            <maxFileSize>${MAX_FILE_SIZE}</maxFileSize>
+            <!-- 保留天数：默认 15 天，超期自动删除 -->
+            <maxHistory>${MAX_HISTORY}</maxHistory>
+            <!-- 全部历史文件总大小封顶，超出时从最旧的开始删 -->
+            <totalSizeCap>20GB</totalSizeCap>
+            <!-- 启动时清理一次超期文件，避免长期不重启导致超期堆积 -->
+            <cleanHistoryOnStart>true</cleanHistoryOnStart>
+        </rollingPolicy>
+    </appender>
+
+    <!-- 异步包装：避免磁盘变慢或 FTP 抖动时拖住消费线程 -->
+    <appender name="ASYNC_FILE" class="ch.qos.logback.classic.AsyncAppender">
+        <queueSize>8192</queueSize>
+        <!-- 0 表示队列满也不丢弃任何级别（默认会丢 TRACE/DEBUG/INFO） -->
+        <discardingThreshold>0</discardingThreshold>
+        <!-- false：队列满时阻塞调用线程，宁可慢也不丢日志 -->
+        <neverBlock>false</neverBlock>
+        <!-- 异步线程里补算调用位置，保证 %line 有值 -->
+        <includeCallerData>true</includeCallerData>
+        <appender-ref ref="FILE"/>
+    </appender>
+
+    <!-- ====================== 级别默认值 ====================== -->
+    <!-- 以下为兜底默认值，application.yml 的 logging.level.* 会覆盖同名 logger -->
+    <logger name="com.example.kafkaloader" level="DEBUG"/>
+
+    <!-- Kafka 客户端：WARN 足够，调成 DEBUG 会每秒刷大量连接/拉取日志 -->
+    <logger name="org.apache.kafka" level="WARN"/>
+    <logger name="org.springframework.kafka" level="INFO"/>
+
+    <!-- Web 容器与安全过滤链，INFO 即可 -->
+    <logger name="org.apache.catalina" level="INFO"/>
+    <logger name="org.apache.tomcat" level="INFO"/>
+    <logger name="org.springframework.web" level="INFO"/>
+    <logger name="org.springframework.boot.actuate" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="ASYNC_FILE"/>
+    </root>
+
+</configuration>

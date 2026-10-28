@@ -1,0 +1,279 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>2.7.18</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>kafka-file-loader</artifactId>
+    <version>1.0.0</version>
+    <name>kafka-file-loader</name>
+    <description>Kafka 消息消费并生成分片文件，备份后投递到 FTP（配置来自文件，不连任何数据库）</description>
+
+    <properties>
+        <java.version>1.8</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <!-- 压测规模，可用 -Dloadtest.records=... 覆盖 -->
+        <loadtest.records>200000</loadtest.records>
+        <loadtest.sustained-records>500000</loadtest.sustained-records>
+        <loadtest.compare-records>200000</loadtest.compare-records>
+        <loadtest.outage-records>100000</loadtest.outage-records>
+        <loadtest.wave>20000</loadtest.wave>
+        <loadtest.partitions>3</loadtest.partitions>
+        <loadtest.records-per-file>50000</loadtest.records-per-file>
+
+        <!-- 发布包命名：服务名-版本号.tar.gz（如 kafka-file-loader-1.0.0.tar.gz） -->
+        <package.name>${project.artifactId}-${project.version}</package.name>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-ui</artifactId>
+            <version>1.6.15</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-net</groupId>
+            <artifactId>commons-net</artifactId>
+            <version>3.9.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- 压测用：JVM 内嵌入式 Kafka broker，无需外部 Kafka 即可跑真实端到端压测 -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- 压测用：本地模拟 FTP 服务端，让 commons-net 走真实 FTP 协议（loopback） -->
+        <dependency>
+            <groupId>org.mockftpserver</groupId>
+            <artifactId>MockFtpServer</artifactId>
+            <version>3.1.0</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>kafka-file-loader</finalName>
+
+        <!--
+          配置分离：application.yml / logback-spring.xml 不打进 jar，
+          而是由 assembly 复制到分发包的 config/ 目录，部署后可直接改，无需重新打包
+        -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <excludes>
+                    <exclude>application.yml</exclude>
+                    <exclude>logback-spring.xml</exclude>
+                </excludes>
+            </resource>
+        </resources>
+
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <!-- ZIP 布局 -> 使用 PropertiesLauncher，支持 -Dloader.path 从外部 lib/ 加载依赖 -->
+                    <layout>ZIP</layout>
+                    <includes>
+                        <!-- 只留业务类，第三方依赖全部外置到 lib/ -->
+                        <include>
+                            <groupId>nothing</groupId>
+                            <artifactId>nothing</artifactId>
+                        </include>
+                    </includes>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <encoding>UTF-8</encoding>
+                </configuration>
+            </plugin>
+
+            <!--
+              在 MANIFEST 里写 Loader-Path: lib，
+              这样在 dist 目录下直接 java -jar 也能找到依赖（不必强制带 -Dloader.path）
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <archive>
+                        <manifestEntries>
+                            <Loader-Path>lib</Loader-Path>
+                        </manifestEntries>
+                    </archive>
+                </configuration>
+            </plugin>
+
+            <!-- 运行时依赖复制到 target/dist-lib，最终由 assembly 放进 lib/ -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>copy-runtime-dependencies</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>copy-dependencies</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/dist-lib</outputDirectory>
+                            <!-- runtime 包含 compile+runtime，自动排除 test / provided -->
+                            <includeScope>runtime</includeScope>
+                            <overWriteIfNewer>true</overWriteIfNewer>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- 每次打包把构建记录写进 CHANGELOG.txt（按年月日分组，UTF-8） -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <execution>
+                        <id>append-changelog</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
+                        <configuration>
+                            <target>
+                                <tstamp>
+                                    <format property="cl.day" pattern="yyyy-MM-dd"/>
+                                    <format property="cl.now" pattern="yyyy-MM-dd HH:mm:ss"/>
+                                </tstamp>
+                                <loadfile property="cl.content" encoding="UTF-8"
+                                          srcFile="${project.basedir}/CHANGELOG.txt"/>
+                                <!-- 当天还没有记录时才带日期标题；同一天多次打包只追加构建行 -->
+                                <condition property="cl.header"
+                                           value="${line.separator}【${cl.day}】版本 ${project.version}${line.separator}">
+                                    <not>
+                                        <contains string="${cl.content}" substring="【${cl.day}】"/>
+                                    </not>
+                                </condition>
+                                <!-- 默认空标题：property 不可覆盖，已设置则保持上面的日期标题 -->
+                                <property name="cl.header" value=""/>
+                                <echo file="${project.basedir}/CHANGELOG.txt" append="true"
+                                      encoding="UTF-8"
+                                      message="${cl.header}  - ${cl.now}  打包构建 v${project.version}${line.separator}"/>
+                            </target>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- 组装分发包：
+                   1) target/dist/                        可直接运行的目录（启动脚本按此路径探测）
+                   2) target/服务名-版本号.tar.gz           对外发布的压缩包 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <configuration>
+                    <!-- 依赖文件名较长，posix 模式避免 tar 路径截断 -->
+                    <tarLongFileMode>posix</tarLongFileMode>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>make-dist-dir</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                        <configuration>
+                            <descriptors>
+                                <descriptor>src/assembly/dist.xml</descriptor>
+                            </descriptors>
+                            <formats>
+                                <format>dir</format>
+                            </formats>
+                            <finalName>dist</finalName>
+                            <appendAssemblyId>false</appendAssemblyId>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>make-tarball</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                        <configuration>
+                            <descriptors>
+                                <descriptor>src/assembly/dist.xml</descriptor>
+                            </descriptors>
+                            <formats>
+                                <format>tar.gz</format>
+                            </formats>
+                            <!-- kafka-file-loader-1.0.0.tar.gz -->
+                            <finalName>${package.name}</finalName>
+                            <appendAssemblyId>false</appendAssemblyId>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>-Dfile.encoding=UTF-8</argLine>
+                    <!-- 把压测规模参数传进 fork 出来的测试 JVM -->
+                    <systemPropertyVariables>
+                        <loadtest.records>${loadtest.records}</loadtest.records>
+                        <loadtest.sustained-records>${loadtest.sustained-records}</loadtest.sustained-records>
+                        <loadtest.compare-records>${loadtest.compare-records}</loadtest.compare-records>
+                        <loadtest.outage-records>${loadtest.outage-records}</loadtest.outage-records>
+                        <loadtest.wave>${loadtest.wave}</loadtest.wave>
+                        <loadtest.partitions>${loadtest.partitions}</loadtest.partitions>
+                        <loadtest.records-per-file>${loadtest.records-per-file}</loadtest.records-per-file>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
